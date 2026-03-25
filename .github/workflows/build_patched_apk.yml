@@ -1,0 +1,60 @@
+name: Build patched APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct download URL for the YouTube APK'
+        required: true
+        default: 'https://www.apkmirror.com/wp-content/themes/APKMirror/download.php?id=13005346&key=92ae06828e47c2f282fe199bf296ad5ee8372448&forcebaseapk=true'
+
+jobs:
+  build:
+    name: Build patched YouTube APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download ReVanced CLI
+        run: |
+          curl -L -o revanced-cli.jar \
+            "https://github.com/ReVanced/revanced-cli/releases/download/v6.0.0/revanced-cli-6.0.0-all.jar"
+
+      - name: Download YouTube APK
+        run: |
+          curl -L -o youtube.apk \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
+            "${{ github.event.inputs.apk_url }}"
+
+      - name: Download ReVanced patches
+        run: |
+          PATCHES_URL=$(curl -s https://api.github.com/repos/ReVanced/revanced-patches/releases/latest \
+            | grep "browser_download_url" \
+            | grep "\.rvp\"" \
+            | head -1 \
+            | cut -d '"' -f 4)
+          if [ -z "$PATCHES_URL" ]; then
+            echo "Error: could not determine patches download URL from the latest release." >&2
+            exit 1
+          fi
+          curl -L -o patches.rvp "$PATCHES_URL"
+
+      - name: Patch YouTube APK
+        run: |
+          java -jar revanced-cli.jar patch \
+            -bp patches.rvp \
+            -o youtube-patched.apk \
+            youtube.apk
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-patched
+          path: youtube-patched.apk
+          if-no-files-found: error
