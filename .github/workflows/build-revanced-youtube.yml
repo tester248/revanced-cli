@@ -1,0 +1,275 @@
+name: Build Patched YouTube (ReVanced)
+
+# This workflow downloads the ReVanced CLI from its latest release, fetches the
+# YouTube APK for Android 11 arm64 from APKMirror, applies the supplied ReVanced
+# patches, and uploads the patched APK as a workflow artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      patches_url:
+        description: >
+          Direct URL to a ReVanced patches bundle (.rvp file).
+          Example: a browser_download_url from a GitHub releases page.
+        required: true
+        type: string
+
+      youtube_version:
+        description: >
+          YouTube version to download from APKMirror (e.g. 19.16.39).
+          Leave blank to auto-detect the latest version listed on APKMirror.
+        required: false
+        default: ""
+        type: string
+
+      apk_download_url:
+        description: >
+          (Optional) Direct download URL for the YouTube APK.
+          When provided, APKMirror scraping is skipped entirely.
+        required: false
+        default: ""
+        type: string
+
+      output_name:
+        description: Name of the uploaded artifact that will contain the patched APK.
+        required: false
+        default: "revanced-youtube-arm64-android11"
+        type: string
+
+jobs:
+  build:
+    name: Patch YouTube with ReVanced
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Java 17 (required by ReVanced CLI v5+)
+      # ------------------------------------------------------------------
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      # ------------------------------------------------------------------
+      # 2. Download the latest ReVanced CLI JAR from the upstream release
+      # ------------------------------------------------------------------
+      - name: Download ReVanced CLI
+        run: |
+          CLI_URL=$(
+            curl -fsSL https://api.github.com/repos/ReVanced/revanced-cli/releases/latest \
+            | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assets = data.get('assets', [])
+          jar = next(
+              (a['browser_download_url'] for a in assets if a['name'].endswith('.jar')),
+              None,
+          )
+          if not jar:
+              print('ERROR: no JAR asset found in the latest release', file=sys.stderr)
+              sys.exit(1)
+          print(jar)
+          "
+          )
+          echo "ReVanced CLI download URL: $CLI_URL"
+          curl -fL -o revanced-cli.jar "$CLI_URL"
+          java -jar revanced-cli.jar --version
+
+      # ------------------------------------------------------------------
+      # 3. Download the ReVanced patches bundle
+      # ------------------------------------------------------------------
+      - name: Download ReVanced patches
+        env:
+          PATCHES_URL: ${{ inputs.patches_url }}
+        run: |
+          curl -fL -o patches.rvp "$PATCHES_URL"
+          echo "patches.rvp size: $(wc -c < patches.rvp) bytes"
+
+      # ------------------------------------------------------------------
+      # 4. Obtain the YouTube APK (arm64-v8a, Android 11-compatible)
+      # ------------------------------------------------------------------
+      - name: Download YouTube APK
+        env:
+          YOUTUBE_VERSION: ${{ inputs.youtube_version }}
+          APK_DOWNLOAD_URL: ${{ inputs.apk_download_url }}
+        run: |
+          pip install --quiet requests
+
+          python3 << 'PYEOF'
+          import os
+          import re
+          import sys
+          import requests
+
+          apk_url_override = os.environ.get("APK_DOWNLOAD_URL", "").strip()
+          youtube_version  = os.environ.get("YOUTUBE_VERSION",  "").strip()
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/119.0.6045.163 Mobile Safari/537.36"
+              ),
+              "Accept": (
+                  "text/html,application/xhtml+xml,application/xml;"
+                  "q=0.9,image/webp,*/*;q=0.8"
+              ),
+              "Accept-Language": "en-US,en;q=0.5",
+              "Accept-Encoding": "gzip, deflate, br",
+              "DNT": "1",
+              "Connection": "keep-alive",
+              "Upgrade-Insecure-Requests": "1",
+          })
+
+          # ── Helper: download a URL to a file ────────────────────────────
+          def download(url, dest, label="file"):
+              print(f"Downloading {label}: {url}")
+              with session.get(url, stream=True, allow_redirects=True) as r:
+                  r.raise_for_status()
+                  with open(dest, "wb") as f:
+                      for chunk in r.iter_content(chunk_size=65536):
+                          f.write(chunk)
+              size = os.path.getsize(dest)
+              print(f"  → {dest} ({size:,} bytes)")
+              # YouTube APKs are typically 80–120 MB; flag anything under 10 MB
+              # as likely invalid (HTML error page, redirect, etc.)
+              if size < 10_000_000:
+                  print(f"WARNING: {dest} is unexpectedly small ({size:,} bytes) – "
+                        "expected at least 10 MB for a YouTube APK. "
+                        "The download may have returned an error page.",
+                        file=sys.stderr)
+              return dest
+
+          # ── Option A: caller supplies a direct download URL ──────────────
+          if apk_url_override:
+              print("Using caller-supplied APK URL (skipping APKMirror).")
+              # Derive a sensible filename from the URL or version
+              apk_file = f"youtube-{youtube_version or 'unknown'}.apk"
+              download(apk_url_override, apk_file, "YouTube APK")
+              with open(os.environ["GITHUB_ENV"], "a") as f:
+                  f.write(f"YOUTUBE_APK={apk_file}\n")
+              sys.exit(0)
+
+          # ── Option B: fetch from APKMirror ────────────────────────────────
+          BASE = "https://www.apkmirror.com"
+
+          if youtube_version:
+              version_slug = youtube_version.replace(".", "-")
+              version_url = f"{BASE}/apk/google-inc/youtube/youtube-{version_slug}-release/"
+          else:
+              print("Detecting latest YouTube version from APKMirror …")
+              r = session.get(f"{BASE}/apk/google-inc/youtube/")
+              r.raise_for_status()
+              m = re.search(
+                  r'href="(/apk/google-inc/youtube/youtube-([\d-]+)-release/)"',
+                  r.text,
+              )
+              if not m:
+                  print("ERROR: Could not detect latest YouTube version on APKMirror.",
+                        file=sys.stderr)
+                  sys.exit(1)
+              version_url = BASE + m.group(1)
+              youtube_version = m.group(2).replace("-", ".")
+              print(f"Latest YouTube version detected: {youtube_version}")
+
+          print(f"Version page: {version_url}")
+          r = session.get(version_url)
+          r.raise_for_status()
+
+          # Prefer arm64-v8a APK; fall back to the first available APK page
+          # APKMirror variant pages contain the architecture in the URL or
+          # in the surrounding anchor text.
+          arm64_paths = re.findall(
+              r'href="(/apk/google-inc/youtube/youtube-[^"]*-android-apk-download/[^"]*)"',
+              r.text,
+          )
+          # Filter for arm64 candidates by looking at the context around each link.
+          # Cache the find() result to avoid scanning the page twice per candidate.
+          arm64_candidates = []
+          for p in arm64_paths:
+              pos = r.text.find(p)
+              if "arm64" in r.text[max(0, pos - 200):pos + 200].lower():
+                  arm64_candidates.append(p)
+          dl_page_path = (arm64_candidates or arm64_paths or [None])[0]
+
+          if not dl_page_path:
+              print("ERROR: No APK download page found on the version page.", file=sys.stderr)
+              sys.exit(1)
+
+          if arm64_candidates:
+              print("Found arm64-v8a APK download page.")
+          else:
+              print("arm64-v8a variant not found; using first available APK (may be universal).")
+
+          dl_page_url = BASE + dl_page_path
+          print(f"APK download page: {dl_page_url}")
+          r = session.get(dl_page_url)
+          r.raise_for_status()
+
+          # The real download URL is in a `?key=…` query-string link
+          m = re.search(
+              r'"(/wp-content/themes/APKMirror/download\.php[^"]*)"',
+              r.text,
+          )
+          if not m:
+              # Fallback: look for any download.php link
+              m = re.search(r'href="(https?://[^"]*download\.php[^"]*)"', r.text)
+          if not m:
+              print("ERROR: Could not locate the direct download link on the download page.",
+                    file=sys.stderr)
+              # Print only the first 500 characters to help with debugging without
+              # risking exposing sensitive page content in the workflow log.
+              print(r.text[:500])
+              sys.exit(1)
+
+          raw_path = m.group(1)
+          direct_url = raw_path if raw_path.startswith("http") else BASE + raw_path
+
+          apk_file = f"youtube-{youtube_version}.apk"
+          download(direct_url, apk_file, f"YouTube {youtube_version} APK")
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"YOUTUBE_APK={apk_file}\n")
+          PYEOF
+
+      # ------------------------------------------------------------------
+      # 5. Patch the APK with the ReVanced CLI
+      #    -b  → bypass signature/provenance verification on the patches file
+      #    -p  → path to the .rvp patches bundle
+      # ------------------------------------------------------------------
+      - name: Patch YouTube
+        run: |
+          java -jar revanced-cli.jar patch \
+            -b \
+            -p patches.rvp \
+            "${{ env.YOUTUBE_APK }}"
+
+          # ReVanced CLI writes the output alongside the input as
+          # <name>-patched.<ext> (e.g. youtube-19.16.39-patched.apk).
+          PATCHED="${YOUTUBE_APK%.apk}-patched.apk"
+          if [ ! -f "$PATCHED" ]; then
+            PATCHED=$(find . -maxdepth 1 -name "*-patched.apk" | head -1)
+          fi
+          if [ -z "$PATCHED" ] || [ ! -f "$PATCHED" ]; then
+            echo "ERROR: Patched APK not found after running ReVanced CLI." >&2
+            ls -lh ./*.apk 2>/dev/null || true
+            exit 1
+          fi
+          echo "Patched APK: $PATCHED ($(wc -c < "$PATCHED") bytes)"
+          echo "PATCHED_APK=$PATCHED" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # 6. Upload the patched APK as an artifact
+      # ------------------------------------------------------------------
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.output_name }}
+          path: ${{ env.PATCHED_APK }}
+          if-no-files-found: error
+          # APKs are already compressed; skip re-compression.
+          compression-level: 0
